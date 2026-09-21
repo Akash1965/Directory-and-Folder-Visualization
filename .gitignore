@@ -1,0 +1,7 @@
+.build/
+ChangeLink.app/
+.DS_Store
+.env
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
