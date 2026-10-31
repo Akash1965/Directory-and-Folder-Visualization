@@ -1,0 +1,106 @@
+<Window x:Class="ChangeLinkApp.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Change-Link" Height="900" Width="1500" MinHeight="600" MinWidth="1000">
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="300" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!-- Left control panel -->
+        <ScrollViewer Grid.Column="0" Padding="12" Background="#F4F4F6">
+            <StackPanel>
+                <TextBlock Text="Monitored directories" FontWeight="Bold" FontSize="14" Margin="0,0,0,6" />
+                <ListBox x:Name="RootsList" Height="110" Margin="0,0,0,6" />
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,12">
+                    <Button x:Name="AddDirectoryButton" Content="Add Directory" Padding="8,4" Margin="0,0,6,0" Click="AddDirectoryButton_Click" />
+                    <Button x:Name="RemoveDirectoryButton" Content="Remove" Padding="8,4" Click="RemoveDirectoryButton_Click" />
+                </StackPanel>
+
+                <TextBlock Text="Snapshot interval" FontWeight="Bold" FontSize="14" Margin="0,0,0,6" />
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                    <TextBox x:Name="IntervalValueBox" Width="70" Text="2" Margin="0,0,6,0" />
+                    <ComboBox x:Name="IntervalUnitBox" Width="90" SelectedIndex="1">
+                        <ComboBoxItem Content="Seconds" />
+                        <ComboBoxItem Content="Minutes" />
+                        <ComboBoxItem Content="Hours" />
+                    </ComboBox>
+                </StackPanel>
+                <Button x:Name="ApplyIntervalButton" Content="Apply" Padding="8,4" HorizontalAlignment="Left" Margin="0,0,0,4" Click="ApplyIntervalButton_Click" />
+                <TextBlock x:Name="IntervalErrorText" Foreground="Red" TextWrapping="Wrap" Margin="0,0,0,10" />
+
+                <CheckBox x:Name="LiveUpdatesCheck" Content="Live updates" IsChecked="True" Margin="0,0,0,10" Checked="LiveUpdatesCheck_Changed" Unchecked="LiveUpdatesCheck_Changed" />
+
+                <Button x:Name="StartStopButton" Content="Start Monitoring" Padding="8,6" Margin="0,0,0,6" Click="StartStopButton_Click" />
+                <Button x:Name="TakeSnapshotButton" Content="Take Snapshot Now" Padding="8,6" Margin="0,0,0,6" Click="TakeSnapshotButton_Click" />
+                <Button x:Name="SetBaselineButton" Content="Set Latest as New Baseline" Padding="8,6" Margin="0,0,0,14" Click="SetBaselineButton_Click" />
+
+                <TextBlock Text="Change filter" FontWeight="Bold" FontSize="14" Margin="0,0,0,6" />
+                <ComboBox x:Name="FilterBox" Margin="0,0,0,14" SelectionChanged="FilterBox_Changed">
+                    <ComboBoxItem Content="All" IsSelected="True" />
+                    <ComboBoxItem Content="Create" />
+                    <ComboBoxItem Content="Delete" />
+                    <ComboBoxItem Content="Modify" />
+                    <ComboBoxItem Content="Rename" />
+                    <ComboBoxItem Content="Move" />
+                </ComboBox>
+
+                <TextBlock Text="Legend" FontWeight="Bold" FontSize="14" Margin="0,0,0,6" />
+                <StackPanel x:Name="LegendPanel" />
+
+                <TextBlock x:Name="StatusText" TextWrapping="Wrap" Margin="0,14,0,0" Foreground="#444" />
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- Right panel: two trees + summary -->
+        <Grid Grid.Column="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="2*" MinHeight="200" />
+                <RowDefinition Height="6" />
+                <RowDefinition Height="3*" MinHeight="200" />
+            </Grid.RowDefinitions>
+
+            <Grid Grid.Row="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0" BorderBrush="#DDD" BorderThickness="0,0,1,0">
+                    <DockPanel>
+                        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="8,4" Background="#FAFAFA">
+                            <TextBlock Text="Original tree" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,10,0" />
+                            <Button Content="-" Width="26" Click="OriginalZoomOut_Click" Margin="0,0,2,0" />
+                            <Button Content="+" Width="26" Click="OriginalZoomIn_Click" Margin="0,0,2,0" />
+                            <Button Content="Fit" Width="40" Click="OriginalFit_Click" />
+                        </StackPanel>
+                        <ScrollViewer x:Name="OriginalScroll" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                            <Canvas x:Name="OriginalCanvas" Background="White" />
+                        </ScrollViewer>
+                    </DockPanel>
+                </Border>
+
+                <Border Grid.Column="1">
+                    <DockPanel>
+                        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="8,4" Background="#FAFAFA">
+                            <TextBlock Text="Modified tree" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,10,0" />
+                            <Button Content="-" Width="26" Click="ModifiedZoomOut_Click" Margin="0,0,2,0" />
+                            <Button Content="+" Width="26" Click="ModifiedZoomIn_Click" Margin="0,0,2,0" />
+                            <Button Content="Fit" Width="40" Click="ModifiedFit_Click" />
+                        </StackPanel>
+                        <ScrollViewer x:Name="ModifiedScroll" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
+                            <Canvas x:Name="ModifiedCanvas" Background="White" />
+                        </ScrollViewer>
+                    </DockPanel>
+                </Border>
+            </Grid>
+
+            <GridSplitter Grid.Row="1" HorizontalAlignment="Stretch" Background="#DDD" />
+
+            <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+                <StackPanel x:Name="SummaryPanel" Margin="12" />
+            </ScrollViewer>
+        </Grid>
+    </Grid>
+</Window>

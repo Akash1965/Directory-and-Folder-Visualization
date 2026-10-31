@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>ChangeLinkCore</RootNamespace>
+    <!-- This library is portable, but GetFileId.cs uses Win32 P/Invoke for the NTFS
+         file identity (the equivalent of macOS's fileResourceIdentifier) and falls back
+         to a path-derived identity on any platform where that call is unavailable. -->
+  </PropertyGroup>
+
+</Project>

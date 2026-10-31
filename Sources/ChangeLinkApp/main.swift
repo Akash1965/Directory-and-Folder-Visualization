@@ -1,8 +1,23 @@
 import SwiftUI
-import ChangeLinkCore
-#if os(macOS)
 import AppKit
-#endif
+import ChangeLinkCore
+
+private enum SnapshotCaptureResult: Sendable {
+    case success(Snapshot)
+    case failure(String)
+}
+
+enum IntervalUnit: String, CaseIterable, Identifiable {
+    case seconds = "Seconds", minutes = "Minutes", hours = "Hours"
+    var id: String { rawValue }
+    var multiplier: Double {
+        switch self {
+        case .seconds: return 1
+        case .minutes: return 60
+        case .hours: return 3600
+        }
+    }
+}
 
 @MainActor
 final class MonitorModel: ObservableObject {
@@ -10,14 +25,29 @@ final class MonitorModel: ObservableObject {
     @Published var events: [ChangeEvent] = []
     @Published var isRunning = false
     @Published var interval: TimeInterval = 120
-    @Published var intervalMinutes = "2"
+    @Published var intervalValue = "2"
+    @Published var intervalUnit: IntervalUnit = .minutes
+    @Published var intervalError: String?
+    /// Re-scan as soon as the filesystem reports a change, so the trees update inside the interval.
+    @Published var liveUpdates = true
     @Published var lastSnapshot: Date?
     @Published var snapshotCount = 0
     @Published var nextSnapshot: Date?
     @Published var statusMessage = "Add a directory to begin."
     @Published var currentSnapshots: [String: Snapshot] = [:]
+    /// First snapshot of each root in this monitoring session: the "original" tree.
+    @Published var baselineSnapshots: [String: Snapshot] = [:]
+    /// Original-vs-modified trees and summary per root path.
+    @Published var diffs: [String: RootDiff] = [:]
+    /// Every modification observed since each root's baseline (an item can appear many times).
+    private var changeLog: [String: [ChangeEvent]] = [:]
+    @Published private(set) var isSnapshotInProgress = false
 
-    private var watchers: [String: PollingWatcher] = [:]
+    private var monitoringTask: Task<Void, Never>?
+    private var activeIntervalText = "2 minutes"
+    private var demoRootPaths: Set<String> = []
+    private let liveTrigger = FSEventsTrigger()
+    private var liveRefreshScheduled = false
 
     func addRoot() {
         #if os(macOS)
@@ -27,16 +57,28 @@ final class MonitorModel: ObservableObject {
         panel.allowsMultipleSelection = true
         panel.prompt = "Monitor"
         guard panel.runModal() == .OK else { return }
-        for url in panel.urls where !roots.contains(url) { roots.append(url) }
+        for url in panel.urls where !roots.contains(where: { $0.path == url.path }) { roots.append(url) }
         statusMessage = "\(roots.count) monitored root(s)"
+        if isRunning {
+            refreshLiveWatching()
+            Task { await captureSnapshots() }
+        }
         #endif
     }
 
     func removeRoot(_ root: URL) {
-        watchers[root.path]?.stop()
-        watchers[root.path] = nil
+        currentSnapshots[root.path] = nil
+        baselineSnapshots[root.path] = nil
+        diffs[root.path] = nil
+        changeLog[root.path] = nil
+        demoRootPaths.remove(root.path)
         roots.removeAll { $0 == root }
         statusMessage = "\(roots.count) monitored root(s)"
+        if roots.isEmpty {
+            stop()
+        } else {
+            refreshLiveWatching()
+        }
     }
 
     func toggleMonitoring() {
@@ -44,139 +86,381 @@ final class MonitorModel: ObservableObject {
     }
 
     func start() {
+        let actualRoots = roots.filter { !demoRootPaths.contains($0.path) }
+        let hadDemoRoots = actualRoots.count != roots.count
+        if hadDemoRoots {
+            roots = actualRoots
+            demoRootPaths.removeAll()
+            currentSnapshots = currentSnapshots.filter { entry in
+                actualRoots.contains { $0.path == entry.key }
+            }
+            baselineSnapshots = baselineSnapshots.filter { entry in
+                actualRoots.contains { $0.path == entry.key }
+            }
+            diffs = diffs.filter { entry in
+                actualRoots.contains { $0.path == entry.key }
+            }
+            changeLog = changeLog.filter { entry in
+                actualRoots.contains { $0.path == entry.key }
+            }
+            events.removeAll()
+            snapshotCount = 0
+            lastSnapshot = nil
+        }
         guard !roots.isEmpty else {
-            statusMessage = "Select at least one directory first."
+            statusMessage = hadDemoRoots
+                ? "Demo output is test data. Add a real directory before starting monitoring."
+                : "Select at least one directory first."
+            return
+        }
+        guard let seconds = parsedInterval() else {
+            statusMessage = intervalError ?? "Enter a valid interval."
             return
         }
         stop()
-        guard let minutes = Double(intervalMinutes.trimmingCharacters(in: .whitespacesAndNewlines)),
-              minutes > 0, minutes.isFinite else {
-            statusMessage = "Enter a snapshot interval greater than zero minutes."
-            return
-        }
-        interval = minutes * 60
+        interval = seconds
+        activeIntervalText = intervalText
         isRunning = true
         snapshotCount = 0
-        nextSnapshot = Date().addingTimeInterval(interval)
-        statusMessage = "Monitoring active. First snapshot establishes the baseline."
-        for root in roots {
-            currentSnapshots[root.path] = Snapshotter.take(root: root, hashContents: true)
-            let watcher = PollingWatcher()
-            watchers[root.path] = watcher
-            do {
-                try watcher.start(root: root, interval: interval) { [weak self] changes in
-                Task { @MainActor in
-                    guard let self else { return }
-                    self.events.insert(contentsOf: changes, at: 0)
-                    self.currentSnapshots[root.path] = Snapshotter.take(root: root, hashContents: true)
-                    self.lastSnapshot = Date()
-                    self.snapshotCount += 1
-                    self.nextSnapshot = Date().addingTimeInterval(self.interval)
-                    self.statusMessage = changes.isEmpty
-                        ? "Snapshot \(self.snapshotCount) complete — no changes detected."
-                        : "Snapshot \(self.snapshotCount) complete — \(changes.count) change(s) detected."
+        events.removeAll()
+        currentSnapshots.removeAll()
+        baselineSnapshots.removeAll()
+        diffs.removeAll()
+        changeLog.removeAll()
+        lastSnapshot = nil
+        statusMessage = "Capturing baseline snapshot…"
+        monitoringTask = makeMonitoringLoop(captureFirst: true)
+        refreshLiveWatching()
+    }
+
+    /// (Re)starts the filesystem watcher for the current roots. Safe to call at any time.
+    func refreshLiveWatching() {
+        liveTrigger.stop()
+        guard isRunning, liveUpdates, !roots.isEmpty else { return }
+        let started = liveTrigger.start(paths: roots.map { $0.path }, latency: 0.5) { [weak self] in
+            Task { @MainActor [weak self] in self?.scheduleLiveRefresh() }
+        }
+        if !started {
+            statusMessage = "Live updates are unavailable for these folders; trees refresh at each interval."
+        }
+    }
+
+    /// Coalesces bursts of filesystem events into one rescan.
+    private func scheduleLiveRefresh() {
+        guard isRunning, liveUpdates, !liveRefreshScheduled else { return }
+        liveRefreshScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard let self else { return }
+            // Cleared before scanning so events that arrive during the scan schedule another refresh.
+            self.liveRefreshScheduled = false
+            guard self.isRunning, self.liveUpdates else { return }
+            await self.captureSnapshots(live: true)
+        }
+    }
+
+    /// The repeating schedule. It reads `interval` before every sleep, so a new value takes effect immediately
+    /// when the loop is replaced by `applyInterval()`.
+    private func makeMonitoringLoop(captureFirst: Bool) -> Task<Void, Never> {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if captureFirst { await self.captureSnapshots() }
+            while self.isRunning && !Task.isCancelled {
+                self.nextSnapshot = Date().addingTimeInterval(self.interval)
+                do {
+                    let nanoseconds = max(1, UInt64(self.interval * 1_000_000_000))
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                } catch {
+                    break
                 }
-            }
-            } catch {
-                statusMessage = "Could not monitor \(root.path): \(error.localizedDescription)"
-                watcher.stop()
-                watchers[root.path] = nil
+                guard self.isRunning && !Task.isCancelled else { break }
+                await self.captureSnapshots()
             }
         }
+    }
+
+    private var intervalText: String {
+        let trimmed = intervalValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let unit = intervalUnit.rawValue.lowercased()
+        return "\(trimmed) \(unit)"
+    }
+
+    /// Validates the interval fields and returns the duration in seconds (sets `intervalError` on failure).
+    private func parsedInterval() -> TimeInterval? {
+        let trimmed = intervalValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = Double(trimmed), value.isFinite, value > 0 else {
+            intervalError = "Enter a positive number."
+            return nil
+        }
+        let seconds = value * intervalUnit.multiplier
+        guard seconds >= 1 else {
+            intervalError = "The interval must be at least 1 second."
+            return nil
+        }
+        guard seconds <= 365 * 24 * 3600 else {
+            intervalError = "The interval must be at most 365 days."
+            return nil
+        }
+        intervalError = nil
+        return seconds
+    }
+
+    /// Applies the interval fields. While monitoring, the schedule is replaced immediately; baselines are kept.
+    func applyInterval() {
+        guard let seconds = parsedInterval() else { return }
+        interval = seconds
+        activeIntervalText = intervalText
+        guard isRunning else {
+            statusMessage = "Snapshot interval set to \(intervalText)."
+            return
+        }
+        monitoringTask?.cancel()
+        monitoringTask = makeMonitoringLoop(captureFirst: false)
+        statusMessage = "Interval changed to \(intervalText). The next snapshot follows on the new schedule."
     }
 
     func stop() {
-        watchers.values.forEach { $0.stop() }
-        watchers.removeAll()
+        liveTrigger.stop()
+        monitoringTask?.cancel()
+        monitoringTask = nil
         isRunning = false
         nextSnapshot = nil
-        if roots.isEmpty { statusMessage = "Add a directory to begin." }
+        statusMessage = roots.isEmpty ? "Add a directory to begin." : "Monitoring stopped."
     }
 
     func takeSnapshotNow() {
-        guard !roots.isEmpty else { return }
-        statusMessage = "Snapshot requested. The next comparison will use the captured baseline."
+        guard !roots.isEmpty else {
+            statusMessage = "Select at least one directory before taking a snapshot."
+            return
+        }
+        guard !isSnapshotInProgress else {
+            statusMessage = "A snapshot is already in progress."
+            return
+        }
+        Task { await captureSnapshots() }
+    }
+
+    private func captureSnapshots(live: Bool = false) async {
+        while isSnapshotInProgress {
+            guard !Task.isCancelled else { return }
+            do {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            } catch {
+                return
+            }
+        }
+        guard !roots.isEmpty, !Task.isCancelled else { return }
+        isSnapshotInProgress = true
+        defer { isSnapshotInProgress = false }
+
+        let scanRoots = roots
+        let oldSnapshots = currentSnapshots
+        if !live { statusMessage = "Scanning \(scanRoots.count) root(s)…" }
+        let capturedSnapshots = await Task.detached(priority: .utility) {
+            Dictionary(scanRoots.map { root -> (String, SnapshotCaptureResult) in
+                do {
+                    return (root.path, .success(try Snapshotter.takeValidated(root: root, hashContents: true,
+                                                                       reusingHashesFrom: live ? oldSnapshots[root.path] : nil)))
+                } catch {
+                    return (root.path, .failure(error.localizedDescription))
+                }
+            }, uniquingKeysWith: { first, _ in first })
+        }.value
+        guard !Task.isCancelled else { return }
+
+        var changes: [ChangeEvent] = []
+        var baselineCount = 0
+        var failures: [String] = []
+        var updatedPaths: [String] = []
+        for root in scanRoots where roots.contains(root) {
+            guard let result = capturedSnapshots[root.path] else { continue }
+            let current: Snapshot
+            switch result {
+            case .success(let snapshot):
+                current = snapshot
+            case .failure(let error):
+                failures.append("\(root.lastPathComponent): \(error)")
+                continue
+            }
+            if let previous = oldSnapshots[root.path] {
+                let rootChanges = SnapshotComparator.compare(previous, current)
+                changes.append(contentsOf: rootChanges)
+                // Keep every modification, so an item edited several times is listed several times.
+                changeLog[root.path, default: []].append(contentsOf: rootChanges)
+            } else {
+                baselineCount += 1
+                changeLog[root.path] = []
+            }
+            currentSnapshots[root.path] = current
+            if baselineSnapshots[root.path] == nil { baselineSnapshots[root.path] = current }
+            updatedPaths.append(root.path)
+        }
+        guard !capturedSnapshots.isEmpty else {
+            statusMessage = "No snapshots could be collected."
+            return
+        }
+
+        if !changes.isEmpty {
+            events.insert(contentsOf: changes.sorted { $0.path < $1.path }, at: 0)
+        }
+        let successfulCount = capturedSnapshots.values.filter {
+            if case .success = $0 { return true } else { return false }
+        }.count
+        guard successfulCount > 0 else {
+            statusMessage = "Snapshot failed: \(failures.joined(separator: "; ")). Previous snapshots were kept; no deletions were inferred."
+            return
+        }
+        await rebuildDiffs(for: updatedPaths)
+        if live && failures.isEmpty {
+            lastSnapshot = Date()
+            let total = updatedPaths.reduce(0) { $0 + (diffs[$1]?.summary.total ?? 0) }
+            statusMessage = total == 0
+                ? "Live — no changes since the baseline."
+                : "Live — \(total) change(s) since the baseline (updated \(Date().formatted(date: .omitted, time: .standard)))."
+            return
+        }
+        snapshotCount += 1
+        lastSnapshot = Date()
+        if !failures.isEmpty {
+            statusMessage = "Snapshot incomplete — \(failures.joined(separator: "; ")). Previous snapshots were kept for failed roots."
+        } else if baselineCount == scanRoots.count {
+            statusMessage = "Baseline captured for \(baselineCount) root(s). Monitoring every \(activeIntervalText)."
+        } else if changes.isEmpty {
+            statusMessage = "Snapshot \(snapshotCount) complete — no changes detected."
+        } else {
+            statusMessage = "Snapshot \(snapshotCount) complete — \(changes.count) change(s) detected."
+        }
+    }
+
+    /// Builds the original/modified trees off the main thread (they can be large).
+    private func rebuildDiffs(for paths: [String]) async {
+        let jobs: [(String, Snapshot, Snapshot, [ChangeEvent])] = paths.compactMap { path in
+            guard let baseline = baselineSnapshots[path], let current = currentSnapshots[path] else { return nil }
+            return (path, baseline, current, changeLog[path] ?? [])
+        }
+        guard !jobs.isEmpty else { return }
+        let built: [(String, RootDiff)] = await Task.detached(priority: .utility) {
+            jobs.map { job in
+                (job.0, DirectoryTreeDiff.build(rootPath: job.0, baseline: job.1, current: job.2, history: job.3))
+            }
+        }.value
+        for (path, diff) in built where roots.contains(where: { $0.path == path }) {
+            diffs[path] = diff
+        }
+    }
+
+    /// Makes the latest snapshot the new "original" so only future changes are shown.
+    func resetBaseline() {
+        guard !currentSnapshots.isEmpty, !isSnapshotInProgress else { return }
+        baselineSnapshots = currentSnapshots
+        changeLog.removeAll()
+        statusMessage = "Baseline reset to the latest snapshot."
+        Task { await rebuildDiffs(for: Array(currentSnapshots.keys)) }
+    }
+
+    func loadDemoScenario() {
         stop()
-        start()
+        demoRootPaths.removeAll()
+        do {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ChangeLink-Demo-\(UUID().uuidString)", isDirectory: true)
+            let projects = root.appendingPathComponent("Documents/Projects", isDirectory: true)
+            let reports = root.appendingPathComponent("Documents/Reports", isDirectory: true)
+            let downloads = root.appendingPathComponent("Downloads", isDirectory: true)
+            try FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: reports, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true)
+            try Data("Project plan: draft with design tasks, milestones, and notes.\n".utf8)
+                .write(to: projects.appendingPathComponent("plan.txt"))
+            try Data("Status: in progress; reviewed on Monday.\n".utf8)
+                .write(to: reports.appendingPathComponent("status.txt"))
+            try Data(repeating: 0x41, count: 8192)
+                .write(to: downloads.appendingPathComponent("old-cache.bin"))
+            try Data("Meeting notes, first draft.\n".utf8)
+                .write(to: reports.appendingPathComponent("notes.txt"))
+            try Data("Installer payload.\n".utf8)
+                .write(to: downloads.appendingPathComponent("installer.pkg"))
+
+            let baseline = try Snapshotter.takeValidated(root: root, hashContents: true)
+            try Data("Encrypted-looking test bytes.\n".utf8)
+                .write(to: projects.appendingPathComponent("plan.txt"))
+            try Data("Status: complete.\n".utf8)
+                .write(to: reports.appendingPathComponent("status.txt"))
+            let newFolder = projects.appendingPathComponent("New Feature", isDirectory: true)
+            try FileManager.default.createDirectory(at: newFolder, withIntermediateDirectories: true)
+            try Data("Created after the baseline.\n".utf8)
+                .write(to: newFolder.appendingPathComponent("README.md"))
+            try FileManager.default.removeItem(at: downloads.appendingPathComponent("old-cache.bin"))
+            try FileManager.default.moveItem(at: reports.appendingPathComponent("notes.txt"),
+                                             to: reports.appendingPathComponent("notes-final.txt"))
+            try FileManager.default.moveItem(at: downloads.appendingPathComponent("installer.pkg"),
+                                             to: projects.appendingPathComponent("installer.pkg"))
+
+            let current = try Snapshotter.takeValidated(root: root, hashContents: true)
+            let detected = SnapshotComparator.compare(baseline, current)
+            roots = [root]
+            demoRootPaths = [root.path]
+            events = detected
+            currentSnapshots = [root.path: current]
+            baselineSnapshots = [root.path: baseline]
+            changeLog = [root.path: detected]
+            diffs = [root.path: DirectoryTreeDiff.build(rootPath: root.path, baseline: baseline,
+                                                        current: current, history: detected)]
+            lastSnapshot = current.takenAt
+            snapshotCount = 2
+            nextSnapshot = nil
+            statusMessage = "Demo test data: compared 2 local filesystem snapshots; detected \(detected.count) changes."
+        } catch {
+            statusMessage = "Could not create demo snapshots: \(error.localizedDescription)"
+        }
     }
 }
 
-@main
+/// `swift run` launches the executable without an app bundle, so macOS treats it as a background tool:
+/// its window never becomes the key window and text fields cannot receive keyboard input.
+/// Promoting it to a regular app and activating it fixes typing.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async {
+            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+        }
+    }
+}
+
 struct ChangeLinkApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = MonitorModel()
     var body: some Scene {
-        WindowGroup { DashboardView(model: model) }
+        WindowGroup {
+            DashboardView(model: model)
+                .frame(minWidth: 1250, minHeight: 800)
+        }
+        .defaultSize(width: 1370, height: 850)
     }
-}
-
-struct TreeRow: Identifiable {
-    let id: String
-    let name: String
-    let path: String
-    let depth: Int
-    let kind: ChangeKind?
-    let isDirectory: Bool
-    let size: Int64?
-    let statusText: String?
 }
 
 struct DashboardView: View {
     @ObservedObject var model: MonitorModel
     @State private var selectedKind: ChangeKind?
+    @State private var selectedEvent: ChangeEvent?
+    @State private var showSummary = true
 
     private var filteredEvents: [ChangeEvent] {
-        model.events.filter { selectedKind == nil || $0.kind == selectedKind }
+        timelineEvents.filter { selectedKind == nil || $0.kind == selectedKind }
     }
 
-    private var treeRows: [TreeRow] {
-        var rows: [String: TreeRow] = [:]
-        let eventsByPath = Dictionary(filteredEvents.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
-        for (rootPath, snapshot) in model.currentSnapshots {
-            let rootName = URL(fileURLWithPath: rootPath).lastPathComponent
-            let rootRow = TreeRow(id: rootName, name: rootName, path: rootName, depth: 0,
-                                  kind: nil, isDirectory: true, size: nil, statusText: nil)
-            rows[rootName] = rootRow
-            for record in snapshot.files.values {
-                let components = ([rootName] + record.path.split(separator: "/").map(String.init))
-                let event = eventsByPath[record.path]
-                for index in components.indices {
-                    let path = components[0...index].joined(separator: "/")
-                    let isLeaf = index == components.count - 1
-                    let existing = rows[path]
-                    rows[path] = TreeRow(
-                        id: path,
-                        name: components[index],
-                        path: path,
-                        depth: index,
-                        kind: isLeaf ? event?.kind : existing?.kind,
-                        isDirectory: !isLeaf || record.isDirectory,
-                        size: isLeaf ? record.size : existing?.size,
-                        statusText: isLeaf ? event.map(changeSummary) : existing?.statusText
-                    )
-                }
-            }
+    /// Every change since the baseline, kept current by live updates (same data as the trees and summary).
+    private var timelineEvents: [ChangeEvent] {
+        orderedDiffs.flatMap { diff in
+            diff.summary.entries.filter { !$0.isImplied }.map { $0.event }
         }
-        for event in filteredEvents where event.kind == .delete {
-            let components = event.path.split(separator: "/").map(String.init)
-            guard !components.isEmpty else { continue }
-            for index in components.indices {
-                let path = components[0...index].joined(separator: "/")
-                let isLeaf = index == components.count - 1
-                if rows[path] == nil {
-                    rows[path] = TreeRow(
-                    id: path,
-                    name: components[index],
-                    path: path,
-                    depth: index,
-                    kind: isLeaf ? event.kind : nil,
-                    isDirectory: !isLeaf || event.nodeKind == .directory,
-                    size: isLeaf ? event.previousSize : nil,
-                    statusText: isLeaf ? changeSummary(event) : nil
-                    )
-                }
-            }
-        }
-        return rows.values.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+    }
+
+    /// Diffs in the same order as the monitored roots.
+    private var orderedDiffs: [RootDiff] {
+        model.roots.compactMap { model.diffs[$0.path] }
     }
 
     var body: some View {
@@ -188,30 +472,54 @@ struct DashboardView: View {
                         .foregroundStyle(model.isRunning ? .green : .secondary)
                     ForEach(model.roots, id: \.path) { root in
                         HStack {
-                            Label(root.path, systemImage: "folder")
+                            Label(root.lastPathComponent.hasPrefix("ChangeLink-Demo-") ? "Demo Files" : root.path,
+                                  systemImage: "folder")
                                 .lineLimit(1)
+                                .help(root.path)
                             Spacer()
                             Button("Remove") { model.removeRoot(root) }
                                 .buttonStyle(.borderless)
                         }
                     }
                     Button("Add Directory…", action: model.addRoot)
-                    HStack {
-                        Text("Snapshot every")
-                        TextField("minutes", text: $model.intervalMinutes)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 82)
-                        Text("minutes")
+                    Button("Load Demo Output", action: model.loadDemoScenario)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Snapshot interval")
+                        HStack {
+                            TextField("value", text: $model.intervalValue)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 70)
+                                .onSubmit { model.applyInterval() }
+                            Picker("Unit", selection: $model.intervalUnit) {
+                                ForEach(IntervalUnit.allCases) { Text($0.rawValue).tag($0) }
+                            }
+                            .labelsHidden()
+                            .frame(width: 100)
+                            Button("Apply") { model.applyInterval() }
+                        }
+                        if let error = model.intervalError {
+                            Text(error).font(.caption).foregroundStyle(.red)
+                        } else {
+                            Text(model.isRunning ? "Changes apply immediately while monitoring." : "Used when monitoring starts.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
-                    Text("Any positive duration is accepted.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    .onChange(of: model.intervalUnit) { _ in model.applyInterval() }
+                    Toggle("Live updates", isOn: $model.liveUpdates)
+                        .help("Update the trees as soon as files change, without waiting for the interval.")
+                        .onChange(of: model.liveUpdates) { _ in model.refreshLiveWatching() }
                     Button(model.isRunning ? "Stop Monitoring" : "Start Monitoring",
                            action: model.toggleMonitoring)
                     .buttonStyle(.borderedProminent)
-                    Button("Take Snapshot Now", action: model.takeSnapshotNow)
+                    Button(model.isSnapshotInProgress ? "Snapshot in Progress…" : "Take Snapshot Now",
+                           action: model.takeSnapshotNow)
+                        .disabled(model.isSnapshotInProgress)
+                    Button("Set Latest as New Baseline", action: model.resetBaseline)
+                        .disabled(model.currentSnapshots.isEmpty || model.isSnapshotInProgress)
+                        .help("Use the latest snapshot as the Original tree; only later changes will be shown.")
                 }
-                Section("Timeline") {
+                Section("Changes since baseline") {
                     Picker("Filter", selection: $selectedKind) {
                         Text("All").tag(ChangeKind?.none)
                         ForEach(ChangeKind.allCases, id: \.self) {
@@ -219,49 +527,51 @@ struct DashboardView: View {
                         }
                     }
                     .pickerStyle(.menu)
-                    ForEach(filteredEvents, id: \.path) { event in
-                        NavigationLink {
-                            ChangeDetailView(event: event)
-                        } label: {
-                            Label(event.path, systemImage: icon(for: event.kind))
-                                .badge(event.kind.rawValue.uppercased())
-                        }
+                    if filteredEvents.isEmpty {
+                        Text("No changes recorded.")
+                            .foregroundStyle(.secondary)
                     }
-                }
-                Section("Change tree") {
-                    if treeRows.isEmpty {
-                        Text("No changes in the selected filter.")
-                                .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(treeRows) { row in
-                                HStack(spacing: 6) {
-                                    Text(String(repeating: "  ", count: row.depth))
-                                    Image(systemName: row.isDirectory ? "folder.fill" : "doc.fill")
-                                        .foregroundStyle(color(for: row.kind))
-                                    Text(row.name)
-                                    Spacer()
-                                    if let kind = row.kind {
-                                        Text(kind.rawValue.uppercased())
-                                            .font(.caption2.bold())
-                                            .foregroundStyle(color(for: kind))
-                                    }
-                                    if let status = row.statusText {
-                                        Text(status).font(.caption2).foregroundStyle(color(for: row.kind))
-                                    }
-                                }
-                                .help(row.path)
+                    ForEach(Array(filteredEvents.enumerated()), id: \.offset) { _, event in
+                        Button {
+                            selectedEvent = event
+                        } label: {
+                            HStack(spacing: 7) {
+                                Circle()
+                                    .fill(color(for: event.kind))
+                                    .frame(width: 8, height: 8)
+                                Image(systemName: icon(for: event.kind))
+                                    .foregroundStyle(color(for: event.kind))
+                                Text(event.path)
+                                    .layoutPriority(1)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .foregroundStyle(color(for: event.kind))
+                                Spacer(minLength: 4)
+                                changeBadge(event.kind.rawValue.uppercased(), kind: event.kind)
+                            }
+                            .contentShape(Rectangle())
+                            .help("\(event.kind.rawValue.capitalized): \(event.path)")
                         }
+                        .buttonStyle(.plain)
                     }
                 }
             }
             .navigationTitle("Change-Link")
             .frame(minWidth: 360)
         } detail: {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 12) {
                 Text("Historical directory-tree monitoring")
                     .font(.title2.bold())
-                Text(model.statusMessage)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    if model.isSnapshotInProgress {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Text(model.statusMessage)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                }
                 HStack(spacing: 18) {
                     Label("\(model.snapshotCount) completed", systemImage: "camera")
                     if let last = model.lastSnapshot {
@@ -273,36 +583,39 @@ struct DashboardView: View {
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                Divider()
-                Text("Overview + detail")
-                    .font(.headline)
-                Text("Snapshot columns use the Change-Link semantics: blue = exists, white = not yet observed, red = previously existed and is now absent. Select a change to inspect its evidence.")
-                    .foregroundStyle(.secondary)
                 TreeLegend()
-                if !treeRows.isEmpty {
-                    Divider()
-                    Text("Changed directory tree")
-                        .font(.headline)
+                    .help("Left tree: the directory at the baseline. Right tree: the same directory now. Click any folder node to expand or collapse it in both trees.")
+                Divider()
+                if orderedDiffs.isEmpty {
+                    Spacer()
+                    Text("Add a directory and start monitoring (or load the demo output) to see its original and modified trees side by side.")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                    Spacer()
+                } else {
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 8) {
-                            ForEach(treeRows) { row in
-                                HStack(spacing: 8) {
-                                    Text(String(repeating: "    ", count: row.depth))
-                                    Image(systemName: row.isDirectory ? "folder.fill" : "doc.fill")
-                                    Text(row.name)
-                                    Spacer()
-                                    Text((row.kind?.rawValue ?? "context").uppercased())
-                                        .font(.caption.bold())
-                                    if let status = row.statusText {
-                                        Text(status).font(.caption2)
-                                    }
-                                }
-                                .foregroundStyle(color(for: row.kind))
+                        VStack(alignment: .leading, spacing: 28) {
+                            ForEach(orderedDiffs) { diff in
+                                RootDiffSection(diff: diff)
+                                    .id(diff.token)
                             }
                         }
+                        .padding(.bottom, 8)
                     }
                 }
-                Spacer()
+                HStack {
+                    Divider()
+                    Button(showSummary ? "Hide summary" : "Show summary") { showSummary.toggle() }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                        .fixedSize()
+                    Divider()
+                }
+                .frame(height: 16)
+                if showSummary {
+                    SummaryPanel(diffs: orderedDiffs, selectedEvent: $selectedEvent)
+                        .frame(height: 200)
+                }
             }
             .padding()
         }
@@ -318,26 +631,17 @@ struct DashboardView: View {
     }
 
     private func color(for kind: ChangeKind?) -> Color {
-        switch kind {
-        case .create: return .green
-        case .delete: return .red
-        case .modify: return .orange
-        case .rename, .move: return .purple
-        case nil: return .primary
-        }
+        guard let kind else { return .primary }
+        return kind.nodeStatus.color
     }
 
-    private func changeSummary(_ event: ChangeEvent) -> String {
-        var details: [String] = []
-        if let previous = event.previousSize, let current = event.currentSize, previous != current {
-            let delta = current - previous
-            details.append("size \(previous) → \(current) bytes (\(delta >= 0 ? "+" : "")\(delta))")
-        } else if let current = event.currentSize, event.kind == .create {
-            details.append("size \(current) bytes")
-        }
-        if event.contentChanged { details.append("content changed") }
-        if details.isEmpty { return event.kind.rawValue.uppercased() }
-        return details.joined(separator: ", ")
+    private func changeBadge(_ title: String, kind: ChangeKind) -> some View {
+        Text(title)
+            .font(.caption2.bold())
+            .foregroundStyle(color(for: kind))
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(color(for: kind).opacity(0.14), in: Capsule())
     }
 }
 
@@ -348,7 +652,9 @@ struct TreeLegend: View {
             legend("Deleted", .red)
             legend("Modified", .orange)
             legend("Moved/Renamed", .purple)
-            legend("Context", .primary)
+            legend("Unchanged", .gray)
+            Text("dashed = not present on this side")
+                .foregroundStyle(.secondary)
         }
         .font(.caption)
     }
@@ -375,6 +681,16 @@ struct ChangeDetailView: View {
                     LabeledContent("Current size", value: "\(currentSize) bytes")
                 }
                 LabeledContent("Content changed", value: event.contentChanged ? "Yes (hash/metadata evidence)" : "No or not applicable")
+                if let changeKind = event.contentChangeKind, changeKind != .metadataOnly {
+                    LabeledContent("Modification type") {
+                        Text(changeKind.label.capitalized)
+                            .foregroundStyle(changeKind == .likelyEncrypted ? .red : .primary)
+                            .fontWeight(changeKind == .likelyEncrypted ? .bold : .regular)
+                    }
+                    if let before = event.previousEntropy, let after = event.currentEntropy {
+                        LabeledContent("Entropy (bits/byte)", value: String(format: "%.2f → %.2f", before, after))
+                    }
+                }
                 LabeledContent("Stable file ID", value: event.fileID)
                 LabeledContent("Observed", value: event.observedAt.formatted(date: .abbreviated, time: .shortened))
             }
@@ -388,3 +704,6 @@ struct ChangeDetailView: View {
         .padding()
     }
 }
+
+// Explicit entry point: this target has several source files, so SwiftPM treats main.swift as top-level code.
+ChangeLinkApp.main()
